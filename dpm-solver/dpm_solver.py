@@ -114,7 +114,199 @@ class DPM_Solver :
         else :
             raise ValueError('Unsupported skip_type {}'.format(skip_type))
         
+    def get_orders_and_timesteps_for_singlestep_solver(self, steps, order, skip_type, t_T, t_0, device) :
+        if order == 3:
+            K = steps // 3 + 1
+            if steps % 3 == 0:
+                orders = [3,] * (K - 2) + [2, 1]
+            elif steps % 3 == 1:
+                orders = [3,] * (K - 1) + [1]
+            else:
+                orders = [3,] * (K - 1) + [2]
+        elif order == 2:
+            if steps % 2 == 0:
+                K = steps // 2
+                orders = [2,] * K
+            else:
+                K = steps // 2 + 1
+                orders = [2,] * (K - 1) + [1]
+        elif order == 1:
+            K = steps
+            orders = [1,] * steps
+        else:
+            raise ValueError("'order' must be '1' or '2' or '3'.")
+        
+        if skip_type == 'logSNR' :
+            timesteps_outer = self.get_time_steps(skip_type, t_T, t_0, K, device)
+        else :
+            timesteps_outer = self.get_time_steps(skip_type, t_T, t_0, steps, device)[torch.cumsum(torch.tensor([0,] + orders), 0).to(device)]
+        return timesteps_outer, orders
     
+    def dpm_solver_first_update(self, x, s, t, model_s = None, return_intermediate = False) :
+        ns = self.noise_schedule
+        dims = x.dim()
+        lambda_s, lambda_t = ns.marginal_lambda(s), ns.marginal_lambda(t)
+        h = lambda_t - lambda_s
+        log_alpha_s, log_alpha_t = ns.marginal_log_mean_coeff(s), ns.marginal_log_mean_coeff(t)
+        sigma_s, sigma_t = ns.marginal_std(s), ns.marginal_std(t)
+        alpha_t = torch.exp(log_alpha_t)
+
+        # based on Eq (3.7) in the dpm-solver menuscript
+        if model_s is None :
+            model_s = self.model_fn(x, s)
+        x_t = torch.exp(log_alpha_s - log_alpha_t) * x - sigma_t * torch.expm1(h) * model_s
+        
+        if return_intermediate :
+            return x_t, {'model_s' : model_s}
+        else :
+            return x_t
+        
+    def singlestep_dpm_solver_second_update(self, x, s, t, r1 = 0.5, model_s = None, return_intermediate = False) :
+        # algorithm 4 of the dpm-solver paper
+        ns = self.noise_schedule
+        lambda_s, lambda_t = ns.marginal_lambda(s), ns.marginal_lambda(t)
+        h = lambda_s - lambda_t
+        lambda_s1 = lambda_s + r1 * h
+        s1 = ns.inverse_lambda(lambda_s1)
+        log_alphas_s, log_alphas_s1, log_alphas_t = ns.marginal_log_mean_coeff(s), ns.marginal_log_mean_coeff(s1), ns.marginal_log_mean_coeff(t)
+        sigma_s, sigma_s1, sigma_t = ns.marginal_std(s), ns.marginal_std(s1), ns.marginal_std(t)
+        alpha_s1, alpha_t = torch.exp(log_alphas_s1), torch.exp(log_alphas_t)
+
+        phi_11 = torch.exp1(r1 * h)
+        phi_1 = torch.exp1(h)
+
+        if model_s is None :
+            model_s = self.model_fn(x, s)
+        # line #4 of the algorithm 4
+        x_s1 = torch.exp(log_alphas_s1 - log_alphas_s) * x - (sigma_s1 * phi_11) * model_s
+        model_s1 = self.model_fn(x_s1, s1)
+
+        x_t = (
+            torch.exp(log_alphas_t - log_alphas_s) * x
+            - (sigma_t * phi_1) * model_s
+            - (sigma_t * phi_1) * (1. / (2 * r1)) * (model_s1 - model_s)
+        )
+        
+        if return_intermediate :
+            return x_t, {'model_s' : model_s, 'model_s1' : model_s1}
+        else :
+            return x_t
+        
+    def singlestep_dpm_solver_third_update(self, x, s, t, r1 = 1./3., r2 = 2./3., model_s = None, model_s1 = None, return_intermediate = False) :
+        # algorithm 5 of the dpm-solver paper
+        ns = self.noise_schedule
+        lambda_s, lambda_t = ns.marginal_lambda(s), ns.marginal_lambda(t)
+        h = lambda_t - lambda_s
+        lambda_s1 = lambda_s + r1 * h
+        lambda_s2 = lambda_s + r2 * h
+        s1 = ns.inverse_lambda(lambda_s1)
+        s2 = ns.inverse_lambda(lambda_s2)
+        log_alpha_s, log_alpha_s1, log_alpha_s2, log_alpha_t = ns.marginal_log_mean_coeff(s), ns.marginal_log_mean_coeff(s1), ns.marginal_log_mean_coeff(s2), ns.marginal_log_mean_coeff(t)
+        sigma_s, sigma_s1, sigma_s2, sigma_t = ns.marginal_std(s), ns.marginal_std(s1), ns.marginal_std(s2), ns.marginal_std(t)
+        alpha_s1, alpha_s2, alpha_t = torch.exp(log_alpha_s1), torch.exp(log_alpha_s2), torch.exp(log_alpha_t)
+
+        em1_r1h = torch.expm1(r1 * h)
+        em1_r2h = torch.expm1(r2 * h)
+        em1_h = torch.expm1(h)
+
+        em1_r2h_frac_r2h_m1 = torch.expm1(r2 * h) / (r2 * h) - 1.
+        em1_h_frac_h_m1 = em1_h / h - 1.
+
+        if model_s is None :
+            model_s = self.model_fn(x, s)
+        if model_s1 is None :
+            x_s1 = (
+                torch.exp(log_alpha_s1 - log_alpha_s) * x
+                - (sigma_s1 * em1_r1h) * model_s
+            )
+            model_s1 = self.model_fn(x_s1, s1)
+        x_s2 = (
+            torch.exp(log_alpha_s2 - log_alpha_s) * x
+            - (sigma_s2 * em1_r2h) * model_s
+            - r2 / r1 * (sigma_s2 * em1_r2h_frac_r2h_m1) * (model_s1 - model_s)
+        )
+        model_s2 = self.model_fn(x_s2, s2)
+
+        x_t = (
+            torch.exp(log_alpha_t - log_alpha_s) * x
+            - (sigma_t * em1_h) * model_s
+            - (1. / r2) * (sigma_t * em1_h_frac_h_m1) * (model_s2 - model_s)
+        )
+
+        if return_intermediate :
+            return x_t, {'model_s' : model_s, 'model_s1' : model_s1, 'model_s2' : model_s2}
+        else :
+            return x_t
+        
+    def sample(self, x, steps = 20, t_start = None, t_end = None, order = 2, skip_type = 'time_uniform', solver_type = 'dpmsolver', return_intermediate = False) :
+        t_0 = 1. / self.noise_schedule.total_N if t_end is None else t_end
+        t_T = self.noise_schedule.T if t_start is None else t_start
+
+        device = x.device
+        intermediates = []
+
+        with torch.no_grad() :
+            timesteps_outer, orders = self.get_orders_and_timesteps_for_singlestep_solver(steps = steps, order = order, skip_type = skip_type, t_T = t_T, t_0 = t_0, device = device)
+
+            for step, order in enumerate(orders) :
+                s, t = timesteps_outer[step], timesteps_outer[step + 1]
+                timesteps_inner = self.get_time_steps(skip_type = skip_type, t_T = s.item(), t_0 = t.item(), N = order, device = device)
+                lambda_inner = self.noise_schedule.marginal_lambda(timesteps_inner)
+                h = lambda_inner[-1] - lambda_inner[0]
+                r1 = None if order <= 1 else (lambda_inner[1] - lambda_inner[0]) / h
+                r2 = None if order <= 2 else (lambda_inner[2] - lambda_inner[0]) / h
+                x = self.singlestep_dpm_solver_update(x, s, t, order, return_intermediate=return_intermediate, r1 = r1, r2 = r2)
+
+        return x
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        
+    def singlestep_dpm_solver_update(self, x, s, t, order, return_intermediate = False, r1 = None, r2 = None) :
+        if order == 1 :
+            return self.dpm_solver_first_update(x, s, t, return_intermediate=return_intermediate)
+        elif order == 2 :
+            return self.singlestep_dpm_solver_second_update(x, s, t, return_intermediate=return_intermediate, r1 = r1)
+        elif order == 3 :
+            return self.singlestep_dpm_solver_third_update(x, s, t, return_intermediate=return_intermediate, r1 = r1, r2 = r2)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 def interpolate_fn(x, xp, yp):
     """
